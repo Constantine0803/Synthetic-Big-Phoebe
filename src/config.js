@@ -77,8 +77,16 @@ SKD.CONFIG = {
       sameOffset: 1
     },
 
+    /* dropWeights 与 dropPool 一一对应，长度必须一致；是相对权重，不必凑成 100。
+       写错时启动会在控制台报出具体是哪一项不对（见 game.js 的 validateDropConfig）。 */
     dropPool: [0, 1, 2, 3, 4],          // 可以投出来的等级（0 = 漂喵喵）
-    dropWeights: [26, 26, 20, 16, 12]   // 对应权重
+    dropWeights: [26, 26, 20, 16, 12],  // 对应权重
+
+    /* 开局保底：前 openingGraceDrops 颗只投「不大于 openingGraceMaxTier」的等级。
+       否则有 12% 的概率第一颗就是 tier4（半径 45），整局开局难度完全由运气决定。
+       置 openingGraceDrops: 0 即可完全关闭这个保底。 */
+    openingGraceDrops: 3,
+    openingGraceMaxTier: 1
   },
 
   /* ------------------------------- 音频 -----------------------------------
