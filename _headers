@@ -1,0 +1,20 @@
+# 静态站点的响应头（Netlify / Cloudflare Pages 会自动读取发布目录里的 _headers）
+#
+# 说明：故意不设 X-Content-Type-Options: nosniff。
+# 换素材时很容易出现「扩展名和真实格式不符」（比如 m4a 存成 .mp3），
+# 靠浏览器嗅探还能放出来，加上 nosniff 就会直接坏掉。
+
+/*
+  Cache-Control: public, max-age=3600
+  Referrer-Policy: no-referrer-when-downgrade
+
+# 入口页永远不缓存，改完重新部署立刻生效
+/index.html
+  Cache-Control: no-cache
+
+/
+  Cache-Control: no-cache
+
+# 代码短缓存，方便边改边测
+/src/*
+  Cache-Control: public, max-age=600
