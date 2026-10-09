@@ -94,7 +94,81 @@ window.SKD = window.SKD || {};
     return pool[pool.length - 1];
   }
 
+  /* ----------------------------- 连号保底 --------------------------------
+   * 00 和 01 只能互相合成，连续摸到同一种小号等于直接往场上丢死球。
+   * 这里把一个连击到上限的等级临时移出池子，并把它那份权重平均分给同族其它
+   * 等级——总权重不变，所以 20/16/12 这些配好的概率完全不受影响。
+   * 必须返回新数组：R.dropPool / R.dropWeights 是全局配置，就地改会把它改坏。
+   * ---------------------------------------------------------------------- */
+  function pityPool(pool, weights, banned, group) {
+    var idx = pool.indexOf(banned);
+    if (idx < 0) return null;                  // 被禁等级本来就不在池子里
+
+    var others = [], i;
+    for (i = 0; i < pool.length; i++) {
+      if (i !== idx && group.indexOf(pool[i]) >= 0) others.push(i);
+    }
+    if (!others.length) return null;           // 同族没有可替换的对象，保底无法生效
+
+    var share = weights[idx] / others.length;
+    var np = [], nw = [];
+    for (i = 0; i < pool.length; i++) {
+      if (i === idx) continue;
+      np.push(pool[i]);
+      nw.push(weights[i] + (group.indexOf(pool[i]) >= 0 ? share : 0));
+    }
+    return { pool: np, weights: nw };
+  }
+
+  /* 连击计数：只记 pityTiers 组内的等级。组外等级既不计数、也不重置计数——
+     这正是「0 / 2 / 0 / 3 / 0 里那三颗 0 也算连击」的原因。 */
+  function notePity(game, tier) {
+    var group = R.pityTiers || [];
+    if (group.indexOf(tier) < 0) return;
+    if (tier === game.pityLast) game.pityStreak++;
+    else { game.pityLast = tier; game.pityStreak = 1; }
+  }
+
+  /* 连号保底配置自检，规则同 validateDropConfig：写错就大声报出来并修正到安全状态 */
+  function validatePityConfig() {
+    var group = R.pityTiers;
+    var maxTier = CFG.tiers.length;
+    var i, t;
+
+    if (!group || typeof group.length !== 'number') {
+      console.error('[SKD] rules.pityTiers 必须是数组，连号保底已关闭。', group);
+      R.pityTiers = [];
+      R.pityMaxStreak = 0;
+      return;
+    }
+
+    var ok = [];
+    for (i = 0; i < group.length; i++) {
+      t = group[i];
+      if (typeof t !== 'number' || !isFinite(t) || t !== Math.floor(t) || t < 0 || t >= maxTier) {
+        console.error('[SKD] rules.pityTiers[' + i + '] = ' + t +
+          ' 不是合法等级（应为 0 ~ ' + (maxTier - 1) + ' 的整数），已忽略。');
+        continue;
+      }
+      ok.push(t);
+    }
+    if (ok.length !== group.length) R.pityTiers = ok;
+
+    if (ok.length < 2) {
+      console.error('[SKD] rules.pityTiers 至少需要 2 个等级才能互相替换（当前 ' +
+        ok.length + ' 个），连号保底不会生效。', R.pityTiers);
+    }
+
+    var n = R.pityMaxStreak;
+    if (typeof n !== 'number' || !isFinite(n) || n !== Math.floor(n)) {
+      console.error('[SKD] rules.pityMaxStreak = ' + n +
+        ' 不是合法整数（应为整数，< 1 表示关闭），连号保底已关闭。');
+      R.pityMaxStreak = 0;
+    }
+  }
+
   validateDropConfig();
+  validatePityConfig();
 
   function Game(world, skin, sound) {
     this.world = world;
@@ -124,6 +198,8 @@ window.SKD = window.SKD || {};
     this.unlocked = this.loadUnlocked();
     this.mergeCount = 0;
     this.graceLeft = 0;          // 开局保底还剩几颗，见 randomTier
+    this.pityLast = -1;          // 连号保底：上一次抽到的同族等级
+    this.pityStreak = 0;         // 连号保底：它已经连了几颗
     this.maxTierReached = 0;
 
     /* 外部事件钩子（main.js 里挂 DOM 更新） */
@@ -174,7 +250,16 @@ window.SKD = window.SKD || {};
       if (gp.length) { pool = gp; weights = gw; }
     }
 
-    return pickWeighted(pool, weights);
+    /* 连号保底：同族连击到上限就把这一族禁掉，权重让给同族其它等级。
+       pityMaxStreak 未定义时条件为 false（旧调用方式），等价于关闭。 */
+    if (R.pityMaxStreak >= 1 && this.pityStreak >= R.pityMaxStreak) {
+      var alt = pityPool(pool, weights, this.pityLast, R.pityTiers || []);
+      if (alt) { pool = alt.pool; weights = alt.weights; }
+    }
+
+    var tier = pickWeighted(pool, weights);
+    notePity(this, tier);
+    return tier;
   };
 
   /* -------------------------------- 开局 --------------------------------- */
@@ -192,6 +277,8 @@ window.SKD = window.SKD || {};
     this.mergeCount = 0;
     /* 重置保底额度要在下面两次 randomTier() 之前，否则开局那两颗就不受保底约束了 */
     this.graceLeft = R.openingGraceDrops;
+    this.pityLast = -1;
+    this.pityStreak = 0;
     this.maxTierReached = 0;
     this.particles.length = 0;
     this.popups.length = 0;
