@@ -12,6 +12,164 @@ window.SKD = window.SKD || {};
   var CFG = SKD.CONFIG;
   var R = CFG.rules;
 
+  /* --------------------------- 投放配置：自检 -----------------------------
+   * dropPool 和 dropWeights 是两个靠下标对齐的平行数组，写错时的后果非常隐蔽：
+   *   - 少写一项权重 -> total 变成 NaN -> 所有比较都是 false -> 静默退化成
+   *     「永远只投第一个等级」，游戏能跑但完全不对，极难排查；
+   *   - 权重填了负数 -> 某一级被悄悄饿死，概率质量无声挪走；
+   *   - pool 里写了越界等级 -> 之后 CFG.tiers[越界].r 直接抛异常。
+   * 所以在启动时查一次，把问题指名道姓地报出来，并把池子修正到合法状态，
+   * 保证「要么配置是对的，要么控制台里有明确的一行」。
+   * ---------------------------------------------------------------------- */
+  function validateDropConfig() {
+    var pool = R.dropPool;
+    var weights = R.dropWeights;
+    var maxTier = CFG.tiers.length;
+    var i, total;
+    var okPool = [], okWeights = [];
+
+    if (!pool || !weights || !pool.length || !weights.length) {
+      console.error('[SKD] rules.dropPool / rules.dropWeights 为空，退回到只投 0 号', pool, weights);
+      R.dropPool = [0];
+      R.dropWeights = [1];
+      return;
+    }
+
+    if (pool.length !== weights.length) {
+      console.error('[SKD] rules.dropPool 有 ' + pool.length + ' 项，rules.dropWeights 有 ' +
+        weights.length + ' 项，两者长度必须一致。', pool, weights);
+    }
+
+    /* 遍历 pool 的长度：weights 少写时多出来的下标会取到 undefined，被下面的类型检查抓住 */
+    for (i = 0; i < pool.length; i++) {
+      var t = pool[i];
+      var w = weights[i];
+
+      if (typeof t !== 'number' || !isFinite(t) || t !== Math.floor(t) || t < 0 || t >= maxTier) {
+        console.error('[SKD] rules.dropPool[' + i + '] = ' + t +
+          ' 不是合法等级（应为 0 ~ ' + (maxTier - 1) + ' 的整数），该等级已被忽略。');
+        continue;
+      }
+      if (typeof w !== 'number' || !isFinite(w) || w < 0) {
+        console.error('[SKD] rules.dropWeights[' + i + '] = ' + w +
+          ' 不是合法权重（应为 >= 0 的有限数），等级 ' + t + ' 已被忽略。');
+        continue;
+      }
+      okPool.push(t);
+      okWeights.push(w);
+    }
+
+    if (!okPool.length) {
+      console.error('[SKD] dropPool 里没有任何合法等级，退回到只投 0 号。');
+      okPool = [0];
+      okWeights = [1];
+    } else {
+      total = 0;
+      for (i = 0; i < okWeights.length; i++) total += okWeights[i];
+      if (!(total > 0)) {
+        console.error('[SKD] dropWeights 加起来是 0，退回到等权重。', R.dropWeights);
+        okWeights = okPool.map(function () { return 1; });
+      }
+    }
+
+    R.dropPool = okPool;
+    R.dropWeights = okWeights;
+  }
+
+  /* 加权抽样：返回 pool 里的某一项，pool 与 weights 一一对应。
+     权重是相对值，total 动态求和，所以改权重会自动归一化，不必凑成 100。 */
+  function pickWeighted(pool, weights) {
+    var total = 0, i;
+    for (i = 0; i < pool.length; i++) total += weights[i];
+
+    /* 防御：配置被 window.HCFB.config 在运行时改坏时（NaN / 全 0），别返回 NaN */
+    if (!(total > 0)) return pool[0];
+
+    var x = Math.random() * total;
+    for (i = 0; i < pool.length; i++) {
+      x -= weights[i];
+      if (x <= 0) return pool[i];
+    }
+    /* 浮点误差兜底：Math.random() < 1，所以 x 只可能落在最后一格 */
+    return pool[pool.length - 1];
+  }
+
+  /* ----------------------------- 连号保底 --------------------------------
+   * 00 和 01 只能互相合成，连续摸到同一种小号等于直接往场上丢死球。
+   * 这里把一个连击到上限的等级临时移出池子，并把它那份权重平均分给同族其它
+   * 等级——总权重不变，所以 20/16/12 这些配好的概率完全不受影响。
+   * 必须返回新数组：R.dropPool / R.dropWeights 是全局配置，就地改会把它改坏。
+   * ---------------------------------------------------------------------- */
+  function pityPool(pool, weights, banned, group) {
+    var idx = pool.indexOf(banned);
+    if (idx < 0) return null;                  // 被禁等级本来就不在池子里
+
+    var others = [], i;
+    for (i = 0; i < pool.length; i++) {
+      if (i !== idx && group.indexOf(pool[i]) >= 0) others.push(i);
+    }
+    if (!others.length) return null;           // 同族没有可替换的对象，保底无法生效
+
+    var share = weights[idx] / others.length;
+    var np = [], nw = [];
+    for (i = 0; i < pool.length; i++) {
+      if (i === idx) continue;
+      np.push(pool[i]);
+      nw.push(weights[i] + (group.indexOf(pool[i]) >= 0 ? share : 0));
+    }
+    return { pool: np, weights: nw };
+  }
+
+  /* 连击计数：只记 pityTiers 组内的等级。组外等级既不计数、也不重置计数——
+     这正是「0 / 2 / 0 / 3 / 0 里那三颗 0 也算连击」的原因。 */
+  function notePity(game, tier) {
+    var group = R.pityTiers || [];
+    if (group.indexOf(tier) < 0) return;
+    if (tier === game.pityLast) game.pityStreak++;
+    else { game.pityLast = tier; game.pityStreak = 1; }
+  }
+
+  /* 连号保底配置自检，规则同 validateDropConfig：写错就大声报出来并修正到安全状态 */
+  function validatePityConfig() {
+    var group = R.pityTiers;
+    var maxTier = CFG.tiers.length;
+    var i, t;
+
+    if (!group || typeof group.length !== 'number') {
+      console.error('[SKD] rules.pityTiers 必须是数组，连号保底已关闭。', group);
+      R.pityTiers = [];
+      R.pityMaxStreak = 0;
+      return;
+    }
+
+    var ok = [];
+    for (i = 0; i < group.length; i++) {
+      t = group[i];
+      if (typeof t !== 'number' || !isFinite(t) || t !== Math.floor(t) || t < 0 || t >= maxTier) {
+        console.error('[SKD] rules.pityTiers[' + i + '] = ' + t +
+          ' 不是合法等级（应为 0 ~ ' + (maxTier - 1) + ' 的整数），已忽略。');
+        continue;
+      }
+      ok.push(t);
+    }
+    if (ok.length !== group.length) R.pityTiers = ok;
+
+    if (ok.length < 2) {
+      console.error('[SKD] rules.pityTiers 至少需要 2 个等级才能互相替换（当前 ' +
+        ok.length + ' 个），连号保底不会生效。', R.pityTiers);
+    }
+
+    var n = R.pityMaxStreak;
+    if (typeof n !== 'number' || !isFinite(n) || n !== Math.floor(n)) {
+      console.error('[SKD] rules.pityMaxStreak = ' + n +
+        ' 不是合法整数（应为整数，< 1 表示关闭），连号保底已关闭。');
+      R.pityMaxStreak = 0;
+    }
+  }
+
+  validateDropConfig();
+  validatePityConfig();
+
   function Game(world, skin, sound) {
     this.world = world;
     this.skin = skin;
@@ -39,6 +197,9 @@ window.SKD = window.SKD || {};
     this.elapsed = 0;
     this.unlocked = this.loadUnlocked();
     this.mergeCount = 0;
+    this.graceLeft = 0;          // 开局保底还剩几颗，见 randomTier
+    this.pityLast = -1;          // 连号保底：上一次抽到的同族等级
+    this.pityStreak = 0;         // 连号保底：它已经连了几颗
     this.maxTierReached = 0;
 
     /* 外部事件钩子（main.js 里挂 DOM 更新） */
@@ -73,14 +234,32 @@ window.SKD = window.SKD || {};
   Game.prototype.randomTier = function () {
     var pool = R.dropPool;
     var weights = R.dropWeights;
-    var total = 0, i;
-    for (i = 0; i < pool.length; i++) total += weights[i];
-    var x = Math.random() * total;
-    for (i = 0; i < pool.length; i++) {
-      x -= weights[i];
-      if (x <= 0) return pool[i];
+
+    /* 开局保底：前几颗只投小号，别让「第一颗就是 tier4」这种纯运气决定整局难度。
+       用「剩余额度」而不是「已投放次数」计数：reset() 会先抽 held + next 两颗，
+       按投放次数算的话会多送一颗。graceLeft 未定义时条件为 false
+       （例如直接对着原型调用），等价于关闭保底。 */
+    if (this.graceLeft > 0) {
+      this.graceLeft--;
+      var limit = R.openingGraceMaxTier;
+      var gp = [], gw = [], i;
+      for (i = 0; i < pool.length; i++) {
+        if (pool[i] <= limit) { gp.push(pool[i]); gw.push(weights[i]); }
+      }
+      /* 万一 dropPool 里一个够小的等级都没有，就照常投放，别把池子掏空 */
+      if (gp.length) { pool = gp; weights = gw; }
     }
-    return pool[0];
+
+    /* 连号保底：同族连击到上限就把这一族禁掉，权重让给同族其它等级。
+       pityMaxStreak 未定义时条件为 false（旧调用方式），等价于关闭。 */
+    if (R.pityMaxStreak >= 1 && this.pityStreak >= R.pityMaxStreak) {
+      var alt = pityPool(pool, weights, this.pityLast, R.pityTiers || []);
+      if (alt) { pool = alt.pool; weights = alt.weights; }
+    }
+
+    var tier = pickWeighted(pool, weights);
+    notePity(this, tier);
+    return tier;
   };
 
   /* -------------------------------- 开局 --------------------------------- */
@@ -96,6 +275,10 @@ window.SKD = window.SKD || {};
     this.elapsed = 0;
     this.overTimer = 0;
     this.mergeCount = 0;
+    /* 重置保底额度要在下面两次 randomTier() 之前，否则开局那两颗就不受保底约束了 */
+    this.graceLeft = R.openingGraceDrops;
+    this.pityLast = -1;
+    this.pityStreak = 0;
     this.maxTierReached = 0;
     this.particles.length = 0;
     this.popups.length = 0;
